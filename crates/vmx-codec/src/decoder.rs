@@ -8,6 +8,7 @@ use crate::layout::{parse, quality_preset, Layout};
 use crate::simd::Native;
 use crate::slice::{decode_plane, decode_plane_preview, level_shift, DecodeOut, Sample};
 use crate::tables::{QUALITY_COUNT, SLICE_HEIGHT};
+use crate::workers::Workers;
 use crate::Error;
 
 /// Facts about a compressed frame read from its header.
@@ -33,7 +34,7 @@ pub struct FrameInfo {
 pub struct Decoder {
     layout: Layout,
     presets: Vec<QuantTables>,
-    threads: usize,
+    workers: Workers,
     planes8: Option<Planes<u8>>,
     planes16: Option<Planes<u16>>,
 }
@@ -44,7 +45,7 @@ impl Decoder {
         Ok(Self {
             layout: Layout::new(width, height)?,
             presets: (0..QUALITY_COUNT).map(QuantTables::new).collect(),
-            threads: 1,
+            workers: Workers::new(1),
             planes8: None,
             planes16: None,
         })
@@ -52,7 +53,9 @@ impl Decoder {
 
     /// Sets the number of worker threads for slice-parallel decoding.
     pub fn set_threads(&mut self, threads: usize) {
-        self.threads = threads.max(1);
+        if threads.max(1) != self.workers.n() {
+            self.workers = Workers::new(threads);
+        }
     }
 
     /// Reads the header of a compressed frame without decoding it.
@@ -107,11 +110,11 @@ impl Decoder {
         let streams: Vec<(&[u8], &[u8])> = c.dc.iter().copied().zip(c.ac.iter().copied()).collect();
         if out.format.is_10bit() {
             let pl = self.planes16.get_or_insert_with(|| Planes::new(&l, FILL16));
-            decode_slices(pl, &streams, nplanes, matrix, c.dc_shift, self.threads)?;
+            decode_slices(pl, &streams, nplanes, matrix, c.dc_shift, &self.workers)?;
             planes16_to_frame(pl, &l, c.interlaced, out);
         } else {
             let pl = self.planes8.get_or_insert_with(|| Planes::new(&l, FILL8));
-            decode_slices(pl, &streams, nplanes, matrix, c.dc_shift, self.threads)?;
+            decode_slices(pl, &streams, nplanes, matrix, c.dc_shift, &self.workers)?;
             planes8_to_frame(pl, &l, c.interlaced, out);
         }
         out.interlaced = c.interlaced;
@@ -198,7 +201,7 @@ fn decode_slices<T: Sample + DecodeOut>(
     nplanes: usize,
     matrix: &[u16; 64],
     dc_shift: u32,
-    threads: usize,
+    workers: &Workers,
 ) -> Result<(), Error> {
     let strides = pl.strides;
     // One entry per slice: the slice's rows of each coded plane.
@@ -211,28 +214,20 @@ fn decode_slices<T: Sample + DecodeOut>(
         }
     }
     let n = per_slice.len();
-    if threads <= 1 || n < 2 {
-        for (rows, st) in per_slice.iter_mut().zip(streams) {
-            decode_one_slice(rows, &strides, *st, matrix, dc_shift)?;
-        }
-        return Ok(());
-    }
-    let per = n.div_ceil(threads.min(n));
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = per_slice
-            .chunks_mut(per)
-            .zip(streams.chunks(per))
-            .map(|(rows, st)| {
-                scope.spawn(move || {
-                    for (r, s) in rows.iter_mut().zip(st) {
-                        decode_one_slice(r, &strides, *s, matrix, dc_shift)?;
-                    }
-                    Ok::<(), Error>(())
-                })
-            })
-            .collect();
-        handles.into_iter().try_for_each(|h| h.join().expect("decoder worker panicked"))
-    })
+    let per = n.div_ceil(workers.n().min(n).max(1));
+    let jobs: Vec<_> = per_slice
+        .chunks_mut(per)
+        .zip(streams.chunks(per))
+        .map(|(rows, st)| {
+            move || {
+                for (r, s) in rows.iter_mut().zip(st) {
+                    decode_one_slice(r, &strides, *s, matrix, dc_shift)?;
+                }
+                Ok::<(), Error>(())
+            }
+        })
+        .collect();
+    workers.run(jobs).into_iter().collect()
 }
 
 #[cfg(test)]

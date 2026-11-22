@@ -16,8 +16,8 @@ for very fast software encoding and decoding:
 - slices of 16 lines, each coded on its own, so work splits cleanly across threads
 
 This crate is a **port of [libvmx](https://github.com/openmediatransport/libvmx)**,
-the MIT-licensed C++ reference implementation. It has no dependencies and
-matches libvmx byte for byte (see [Conformance](#conformance)). It is safe
+the MIT-licensed C++ reference implementation. It has no dependencies by
+default and matches libvmx byte for byte (see [Conformance](#conformance)). It is safe
 Rust except for one module, `simd`, which implements the transform's 128-bit
 operations with `std::arch` NEON (aarch64) or SSE2 (x86-64) intrinsics
 (`#![deny(unsafe_code)]` everywhere else). The same operations also exist as
@@ -58,6 +58,23 @@ fn main() -> Result<(), vmx_codec::Error> {
 | `decoder.decode(&[u8], PixelFormat) -> Result<Frame>` | Decompresses one frame into the layout you ask for. |
 | `decoder.decode_preview(&[u8], alpha)` | 1/8-scale preview built from the DC coefficients only. It needs only the first `decoder.preview_len(..)` bytes. |
 | `decoder.info(&[u8])` | Reads the header: quality, DC shift, interlaced flag. |
+
+### Threads
+
+With `threads` above 1, a frame's slices are coded in parallel. By default
+the workers are started for each frame. The optional `rayon` feature keeps
+them running for the life of each encoder and decoder instead, which saves
+the thread starts (at 60 fps and 4 workers, 240 a second per stream). On a
+paced 1080p60 stream (Ryzen AI Max+ 395) it measured:
+
+| Workers | Decode, % of a core | Encode, % of a core |
+|---|---|---|
+| 2, started per frame | 37 | 47 to 51 |
+| 2, kept (`rayon`) | 30 to 33 | 34 to 35 |
+| 4, started per frame | 37 to 38 | 46 to 52 |
+| 4, kept (`rayon`) | 35 to 39 | 42 to 45 |
+
+The output is the same with any number of workers, with or without the feature.
 
 ### Pixel formats (explicit plane layouts)
 

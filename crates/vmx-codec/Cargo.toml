@@ -12,7 +12,13 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+# Keep each encoder's and decoder's slice workers running between frames
+# instead of starting them for every frame (src/workers.rs).
+rayon = ["dep:rayon"]
+
 [dependencies]
+rayon = { version = "1.10", optional = true }
 
 [dev-dependencies]
 libvmx-ref = { path = "../libvmx-ref" }

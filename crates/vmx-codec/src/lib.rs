@@ -64,6 +64,7 @@ mod layout;
 mod simd;
 mod slice;
 mod tables;
+mod workers;
 
 pub use decoder::{Decoder, FrameInfo};
 pub use encoder::{Encoder, EncoderConfig, EncodingParameters, Profile};

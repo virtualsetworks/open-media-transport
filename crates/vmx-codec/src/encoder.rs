@@ -8,6 +8,7 @@ use crate::layout::{quality_preset, write, Layout};
 use crate::simd::Native;
 use crate::slice::{encode_plane, level_shift, Sample};
 use crate::tables::{BITRATE_TABLE, MAX_QUALITY, QUALITY_COUNT, SLICE_HEIGHT};
+use crate::workers::Workers;
 use crate::Error;
 
 /// Encoding profile. Selects the bitrate target, the minimum quality the
@@ -108,7 +109,7 @@ pub struct Encoder {
     quality: i32,
     preset: usize,
     presets: Vec<QuantTables>,
-    threads: usize,
+    workers: Workers,
     planes8: Option<Planes<u8>>,
     planes16: Option<Planes<u16>>,
 }
@@ -134,7 +135,7 @@ impl Encoder {
             quality: 0,
             preset: 0,
             presets: (0..QUALITY_COUNT).map(QuantTables::new).collect(),
-            threads: config.threads.max(1),
+            workers: Workers::new(config.threads),
             planes8: None,
             planes16: None,
         };
@@ -168,7 +169,9 @@ impl Encoder {
 
     /// Changes the number of worker threads (output is unaffected).
     pub fn set_threads(&mut self, threads: usize) {
-        self.threads = threads.max(1);
+        if threads.max(1) != self.workers.n() {
+            self.workers = Workers::new(threads);
+        }
     }
 
     /// Encodes one frame and returns the compressed VMX frame.
@@ -203,11 +206,11 @@ impl Encoder {
         let (dc, ac) = if frame.format.is_10bit() {
             let pl = self.planes16.get_or_insert_with(|| Planes::new(&l, FILL16));
             frame_to_planes16(frame, &l, interlaced, pl);
-            encode_slices(pl, &l, nplanes, matrix, dc_shift, self.threads)
+            encode_slices(pl, &l, nplanes, matrix, dc_shift, &self.workers)
         } else {
             let pl = self.planes8.get_or_insert_with(|| Planes::new(&l, FILL8));
             frame_to_planes8(frame, &l, interlaced, pl);
-            encode_slices(pl, &l, nplanes, matrix, dc_shift, self.threads)
+            encode_slices(pl, &l, nplanes, matrix, dc_shift, &self.workers)
         };
 
         let start = out.len();
@@ -271,31 +274,16 @@ fn encode_slices<T: Sample>(
     nplanes: usize,
     matrix: &[u16; 192],
     dc_shift: u32,
-    threads: usize,
+    workers: &Workers,
 ) -> Streams {
     let n = l.slices;
-    let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(n);
-    if threads <= 1 || n < 2 {
-        for s in 0..n {
-            results.push(encode_one_slice(pl, s, nplanes, matrix, dc_shift));
-        }
-    } else {
-        let per = n.div_ceil(threads.min(n));
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..n)
-                .step_by(per)
-                .map(|start| {
-                    scope.spawn(move || {
-                        (start..(start + per).min(n))
-                            .map(|s| encode_one_slice(pl, s, nplanes, matrix, dc_shift))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            for h in handles {
-                results.extend(h.join().expect("encoder worker panicked"));
-            }
-        });
-    }
+    let per = n.div_ceil(workers.n().min(n).max(1));
+    let jobs: Vec<_> = (0..n)
+        .step_by(per.max(1))
+        .map(|start| {
+            move || (start..(start + per).min(n)).map(|s| encode_one_slice(pl, s, nplanes, matrix, dc_shift)).collect::<Vec<_>>()
+        })
+        .collect();
+    let results: Vec<(Vec<u8>, Vec<u8>)> = workers.run(jobs).into_iter().flatten().collect();
     results.into_iter().unzip()
 }
